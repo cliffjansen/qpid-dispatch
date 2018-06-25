@@ -34,6 +34,7 @@ static qd_timer_list_t  scheduled_timers = {0};
  * The delta_time of the first timer on the queue is measured from timer_base.
  */
 static qd_timestamp_t   time_base = 0;
+qd_timestamp_t   *wake2_time_basep;
 
 ALLOC_DECLARE(qd_timer_t);
 ALLOC_DEFINE(qd_timer_t);
@@ -124,6 +125,12 @@ qd_timestamp_t qd_timer_now() {
 void qd_timer_schedule(qd_timer_t *timer, qd_duration_t duration)
 {
     sys_mutex_lock(lock);
+    if (duration == 0 && timer->scheduled && timer->delta_time == 0) {
+      // already scheduled for right after lock-release based on a wake2 or previous timer_adjust_now_LH()
+      sys_mutex_unlock(lock);
+      return;
+    }
+
     timer_cancel_LH(timer);  // Timer is now on the idle list
     DEQ_REMOVE(idle_timers, timer);
 
@@ -179,6 +186,7 @@ void qd_timer_initialize(sys_mutex_t *server_lock)
     DEQ_INIT(idle_timers);
     DEQ_INIT(scheduled_timers);
     time_base = 0;
+    wake2_time_basep = &time_base;
 }
 
 

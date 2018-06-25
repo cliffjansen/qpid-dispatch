@@ -66,6 +66,14 @@ struct qd_server_t {
     uint64_t                  next_connection_id;
     void                     *py_displayname_obj;
     qd_http_server_t         *http;
+    // wake2 test
+    sys_mutex_t *visit_lock;
+    qd_timestamp_t next_timeout;
+    bool visiting;
+    bool revisit_required;
+    int revisit_count;
+    int max_revisit_count;
+    int nw2, nt;
 };
 
 #define HEARTBEAT_INTERVAL 1000
@@ -850,6 +858,36 @@ static void startup_timer_handler(void *context)
 }
 
 
+static void do_timer_visit(qd_server_t *s, bool is_timeout) {
+    if (is_timeout) {
+        sys_mutex_lock(s->lock);
+        s->next_timeout = 0;  // unlimited competing threads for this value
+        sys_mutex_unlock(s->lock);
+    }
+    sys_mutex_lock(s->visit_lock);
+    if (is_timeout) s->nt++; else s->nw2++;
+    if (s->visiting) {
+        s->revisit_required = true;
+        sys_mutex_unlock(s->visit_lock);
+        return;
+    }
+    s->visiting = true;
+    s->revisit_count = 0;
+    while(true) {
+        s->revisit_required = false;
+        sys_mutex_unlock(s->visit_lock);
+        qd_timer_visit();
+        sys_mutex_lock(s->visit_lock);
+        if (!s->revisit_required) {
+            if (s->max_revisit_count < s->revisit_count) s->max_revisit_count = s->revisit_count;
+            s->visiting = 0;
+            sys_mutex_unlock(s->visit_lock);
+            return;
+        }
+        s->revisit_count++;
+    }
+}
+
 /* Events involving a connection or listener are serialized by the proactor so
  * only one event per connection / listener will be processed at a time.
  */
@@ -870,7 +908,13 @@ static bool handle(qd_server_t *qd_server, pn_event_t *e) {
         return false;
 
     case PN_PROACTOR_TIMEOUT:
-        qd_timer_visit();
+        // qd_timer_visit();
+        do_timer_visit(qd_server, true);
+        break;
+
+    case PN_REACTOR_FINAL:
+        // The WAKE2 event, for the purposes of this test
+        do_timer_visit(qd_server, false);
         break;
 
     case PN_LISTENER_OPEN:
@@ -1163,6 +1207,14 @@ qd_server_t *qd_server(qd_dispatch_t *qd, int thread_count, const char *containe
     qd_server->py_displayname_obj     = 0;
 
     qd_server->http = qd_http_server(qd_server, qd_server->log_source);
+    qd_server->next_timeout = 0;
+    qd_server->visit_lock             = sys_mutex();
+    qd_server->visiting = false;
+    qd_server->revisit_required = false;
+    qd_server->revisit_count = 0;
+    qd_server->max_revisit_count = 0;
+    qd_server->nw2= 0;
+    qd_server->nt=0;
 
     qd_log(qd_server->log_source, QD_LOG_INFO, "Container Name: %s", qd_server->container_name);
 
@@ -1186,6 +1238,8 @@ void qd_server_free(qd_server_t *qd_server)
     }
     qd_timer_finalize();
     sys_mutex_free(qd_server->lock);
+    sys_mutex_free(qd_server->visit_lock);
+    fprintf(stdout, "ZZZ %d %d %d\n", qd_server->nt, qd_server->nw2, qd_server->max_revisit_count);
     sys_cond_free(qd_server->cond);
     Py_XDECREF((PyObject *)qd_server->py_displayname_obj);
     free(qd_server);
@@ -1431,8 +1485,26 @@ bool qd_connector_decref(qd_connector_t* ct)
     return false;
 }
 
+extern qd_timestamp_t *wake2_time_basep;
+
 void qd_server_timeout(qd_server_t *server, qd_duration_t duration) {
-    pn_proactor_set_timeout(server->proactor, duration);
+    // server->lock always held by caller, thread safe
+    if (duration == 0) {
+        pn_proactor_wake2(server->proactor);
+    } else {
+        // do nothing unless the already scheduled next_timeout is too late.  qd_timer_visit will fix things.
+        
+        if (!server->next_timeout) {
+            server->next_timeout = *wake2_time_basep + duration;
+            pn_proactor_set_timeout(server->proactor, duration);
+            return;
+        }
+        if ((*wake2_time_basep + duration) < server->next_timeout) {
+            server->next_timeout = *wake2_time_basep + duration;
+            pn_proactor_set_timeout(server->proactor, duration);
+            return;
+        }
+    }
 }
 
 qd_dispatch_t* qd_server_dispatch(qd_server_t *server) { return server->qd; }
